@@ -1,121 +1,93 @@
 import os
-import streamlit as st
-from langchain.tools import tool
-from langchain.chat_models import init_chat_model
-from langchain.agents import create_agent
-from dotenv import load_dotenv
-import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from pathlib import Path
 
+import streamlit as st
+from dotenv import load_dotenv
+from langgraph.errors import GraphRecursionError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, RateLimitError
 
-load_dotenv()
-
-# # app.py 파일이 위치한 폴더 기준
-# BASE_DIR = Path(__file__).resolve().parent
-
-# # .env 파일 경로 지정
-# env_path = BASE_DIR / ".env"
-
-# # .env 파일 불러오기
-# load_dotenv(dotenv_path=env_path)
-
-# # API 키 확인
-# print("ENV 파일 존재:", env_path.exists())
-# print("API KEY 로드:", bool(os.getenv("OPENAI_API_KEY")))
-
-# if not os.getenv("OPENAI_API_KEY"):
-#     raise ValueError("OPENAI_API_KEY가 설정되지 않았습니다.")
-
-# # API 키 존재 여부 확인
-# if not os.getenv("OPENAI_API_KEY"):
-#     raise ValueError("OPENAI_API_KEY가 설정되지 않았습니다.")
+from chatbot import get_agent, stream_answer
+from weather import LOCATIONS
 
 
-# @tool
-# def current_time() -> str:
-#     '실시간 한국시간을 알려주는 도구입니다.'
-#     # UTC 기준 시간
-#     utc_now = datetime.datetime.now(datetime.timezone.utc)
+def main():
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    st.set_page_config(page_title="날씨 정보 챗봇", page_icon="🌤️")
+    st.title("날씨 정보 챗봇")
+    st.caption("기상청 최신 관측 자료 · 한국 시간 기준 · 동일 지역 조회는 최대 5분간 캐시")
 
-#     # 한국 시간으로 변환 (UTC + 9시간)
-#     kst_timezone = datetime.timezone(datetime.timedelta(hours=9))
-#     kst_now = utc_now.astimezone(kst_timezone)
-#     return f"현재 한국 시간: {kst_now.strftime('%Y-%m-%d %H:%M')}"
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    kma_key = os.getenv("KMA_API_KEY", "").strip()
+    model_name = os.getenv("OPENAI_MODEL", "gpt-6-astra").strip() or "gpt-6-astra"
 
-@tool
-def check_weather() -> dict:
-    """기상청 API로 최근 초단기실황 날씨를 조회합니다."""
+    with st.sidebar:
+        location = st.selectbox("기본 조회 지역", list(LOCATIONS))
+        st.caption("각 도시의 대표 격자 기준입니다. 대화에서 다른 지원 도시를 지정할 수 있습니다.")
+        if st.button("대화 초기화", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.pop("chat_error", None)
+            st.rerun()
+        st.caption(f"모델: {model_name}")
+        st.caption("현재 관측 기온·습도·강수·바람을 제공합니다.")
 
-    url = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0/getUltraSrtNcst"
+    if not kma_key:
+        st.warning(
+            "기상청 인증키가 없습니다. 프로젝트 .env에 KMA_API_KEY를 설정하세요. "
+            "기상청 API허브(apihub.kma.go.kr)에서 인증키를 발급하고 "
+            "초단기실황 API 활용신청을 완료해야 합니다."
+        )
+    if not openai_key:
+        st.warning("프로젝트 .env에 OPENAI_API_KEY를 설정하세요.")
 
-    # 기상청 발표 지연을 고려해 1시간 전 정시 조회
-    now = datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(hours=1)
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    params = {
-        "pageNo": 1,
-        "numOfRows": 100,
-        "dataType": "JSON",
-        "base_date": now.strftime("%Y%m%d"),
-        "base_time": now.strftime("%H00"),
-        "nx": 55,
-        "ny": 127,
-        "authKey": os.getenv("KMA_API_KEY")
-    }
+    pending = bool(st.session_state.messages and st.session_state.messages[-1]["role"] == "user")
+    if st.session_state.get("chat_error"):
+        st.error(st.session_state.chat_error)
+    retry = pending and st.button("응답 다시 시도", disabled=not openai_key)
+    prompt = st.chat_input(
+        "예: 서울 지금 날씨 알려줘", disabled=not openai_key or pending, max_chars=4000,
+    )
+    if not (prompt or retry):
+        return
+    st.session_state.pop("chat_error", None)
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        agent = get_agent(model_name, openai_key, kma_key, location)
+        with st.chat_message("assistant"):
+            with st.spinner("답변을 준비하고 있습니다…"):
+                answer = st.write_stream(stream_answer(agent, st.session_state.messages))
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("empty answer")
+    except AuthenticationError:
+        error = "OpenAI 인증에 실패했습니다. OPENAI_API_KEY를 확인하세요."
+    except RateLimitError:
+        error = "모델 사용 한도에 도달했습니다. 사용량/결제 설정을 확인한 뒤 다시 시도하세요."
+    except (APITimeoutError, APIConnectionError):
+        error = "모델 서버 연결이 지연되거나 실패했습니다. 잠시 후 다시 시도하세요."
+    except APIStatusError:
+        error = "모델 요청에 실패했습니다. OPENAI_MODEL의 모델명과 사용 권한을 확인하세요."
+    except GraphRecursionError:
+        error = "도구 실행 횟수를 초과했습니다. 질문을 구체적으로 바꾸거나 다시 시도하세요."
+    except Exception:
+        error = "답변 생성에 실패했습니다. 설정을 확인하고 다시 시도하세요."
+    else:
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.rerun()
+        return
 
-    except requests.RequestException as e:
-        return {"error": str(e)}
-    except ValueError:
-        return {"error": "JSON 응답을 해석하지 못했습니다."}
-
-
-model = init_chat_model('gpt-6-astra')
-agent = create_agent(model, 
-                     tools=[check_weather], #current_time], 
-                     system_prompt = '당신은 실시간 기상정보 조회 agent입니다.',
-                     
-                     )
-
-
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-
-st.title('날씨 정보 챗봇입니다.')
-
-prompt = st.chat_input('무엇을 도와드릴까요?')
-
-# 이전 대화 화면에 출력
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
+    st.session_state.chat_error = error
+    st.rerun()
 
 
-if prompt:
-    st.session_state.messages.append({'role': 'user', 'content':prompt})
-    response = agent.invoke({
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    })
-
-    answer = response["messages"][-1].content
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer
-    })
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()
